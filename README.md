@@ -51,3 +51,7 @@ master_key_env: VAULT_MASTER_KEY    # 32-byte hex
 ```
 
 See [todo.md](todo.md) for the full task list, API reference, and threat model notes.
+
+## License
+
+Apache 2.0 — see [LICENSE](LICENSE).
