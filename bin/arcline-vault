@@ -1,0 +1,131 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# Command-line client for arcline-vault. Needs only Ruby's standard library, so
+# this one file can be copied to any machine.
+#
+#   export VAULT_URL=https://vault.arcline.it
+#   export VAULT_TOKEN=av_...
+#
+#   arcline-vault set DATABASE_URL "postgres://..." --env production
+#   arcline-vault get DATABASE_URL --env production
+#   arcline-vault list --env production
+#   arcline-vault delete DATABASE_URL --env production
+#   arcline-vault export --env production > .env
+#   arcline-vault import .env --env production
+#   arcline-vault envs
+
+require "json"
+require "net/http"
+require "optparse"
+require "uri"
+
+USAGE = <<~TEXT
+  usage: arcline-vault <command> [arguments] --env ENVIRONMENT
+
+    set NAME VALUE      create or replace a secret ("-" reads the value from stdin)
+    get NAME            print a secret's value
+    list                list secret names
+    delete NAME         delete a secret
+    export [--json]     print every secret as a .env file (or JSON)
+    import FILE         load a .env file ("-" reads stdin)
+    envs                list environments
+    create-env NAME     create an environment
+
+  Reads VAULT_URL and VAULT_TOKEN. --env defaults to VAULT_ENV.
+TEXT
+
+def fail_with(message)
+  warn "arcline-vault: #{message}"
+  exit 1
+end
+
+def api(method, path, body: nil, content_type: "application/json")
+  base = ENV["VAULT_URL"].to_s
+  token = ENV["VAULT_TOKEN"].to_s
+  fail_with "set VAULT_URL to the vault's address" if base.empty?
+  fail_with "set VAULT_TOKEN to your API key" if token.empty?
+
+  uri = URI.join(base.end_with?("/") ? base : "#{base}/", path.delete_prefix("/"))
+  fail_with "refusing to send a token over plain http to #{uri.host}" if uri.scheme != "https" && !%w[ localhost 127.0.0.1 ::1 ].include?(uri.host)
+
+  request = Net::HTTP.const_get(method).new(uri, "Authorization" => "Bearer #{token}", "Accept" => "application/json")
+  if body
+    request["Content-Type"] = content_type
+    request.body = body
+  end
+
+  response = Net::HTTP.start(uri.host, uri.port, use_ssl: uri.scheme == "https", open_timeout: 10, read_timeout: 30) { |http| http.request(request) }
+  return response if response.is_a?(Net::HTTPSuccess)
+
+  message = begin
+    JSON.parse(response.body)["error"]
+  rescue JSON::ParserError, TypeError
+    nil
+  end
+  fail_with message || "the vault answered #{response.code}"
+rescue SystemCallError, SocketError, Timeout::Error, OpenSSL::SSL::SSLError => e
+  fail_with "cannot reach the vault: #{e.message}"
+end
+
+options = { env: ENV["VAULT_ENV"], json: false }
+parser = OptionParser.new do |opts|
+  opts.on("-e", "--env NAME") { |value| options[:env] = value }
+  opts.on("--json") { options[:json] = true }
+  opts.on("-h", "--help") { puts USAGE; exit }
+end
+
+begin
+  arguments = parser.parse(ARGV)
+rescue OptionParser::ParseError => e
+  fail_with e.message
+end
+command = arguments.shift
+
+env_path = lambda do |suffix|
+  fail_with "choose an environment with --env or VAULT_ENV" if options[:env].to_s.empty?
+  "/v1/envs/#{URI.encode_www_form_component(options[:env])}#{suffix}"
+end
+secret_path = ->(name) { env_path.call("/secrets/#{URI.encode_www_form_component(name)}") }
+need = lambda do |count|
+  fail_with "#{command} takes #{count} argument#{'s' unless count == 1}\n\n#{USAGE}" unless arguments.size == count
+  arguments
+end
+
+case command
+when "set"
+  name, value = need.call(2)
+  value = $stdin.read.chomp if value == "-"
+  api(:Post, env_path.call("/secrets"), body: JSON.generate(name: name, value: value))
+  warn "set #{name} in #{options[:env]}"
+when "get"
+  name, = need.call(1)
+  puts JSON.parse(api(:Get, secret_path.call(name)).body).fetch("value")
+when "list"
+  need.call(0)
+  JSON.parse(api(:Get, env_path.call("/secrets")).body).fetch("secrets").each { |secret| puts secret["name"] }
+when "delete"
+  name, = need.call(1)
+  api(:Delete, secret_path.call(name))
+  warn "deleted #{name} from #{options[:env]}"
+when "export"
+  need.call(0)
+  print api(:Get, env_path.call("/export#{'?format=json' if options[:json]}")).body
+  puts if options[:json]
+when "import"
+  file, = need.call(1)
+  text = file == "-" ? $stdin.read : File.read(file)
+  imported = JSON.parse(api(:Post, env_path.call("/import"), body: text, content_type: "text/plain").body).fetch("imported")
+  warn "imported #{imported.size} secret#{'s' unless imported.size == 1} into #{options[:env]}"
+when "envs"
+  need.call(0)
+  JSON.parse(api(:Get, "/v1/envs").body).fetch("environments").each { |env| puts "#{env['name']}\t#{env['secrets']} secrets" }
+when "create-env"
+  name, = need.call(1)
+  api(:Post, "/v1/envs", body: JSON.generate(name: name))
+  warn "created #{name}"
+when nil, "help"
+  puts USAGE
+else
+  fail_with "unknown command #{command.inspect}\n\n#{USAGE}"
+end
